@@ -2,7 +2,6 @@ import argparse
 import os
 import random
 import time
-from distutils.util import strtobool
 from collections import deque
 from types import SimpleNamespace
 
@@ -21,6 +20,7 @@ from gae import compute_advantages
 from env_utils import make_minigrid_env, make_atari_env, make_poc_env, make_classic_env, make_memory_gym_env, make_continuous_env
 from exp_utils import add_common_args, setup_logging, finish_logging
 from layers import layer_init
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -250,6 +250,7 @@ if __name__ == "__main__":
 
     # Environment setup - enhanced with support for multiple env types including Mujoco
     if "ale" in args.gym_id.lower():
+        import ale_py  # noqa: F401 # Register the Atari environments
         envs_lst = [make_atari_env(args.gym_id, args.seed + i, i, args.capture_video, 
                                   run_name, frame_stack=1) for i in range(args.num_envs)]
     elif "minigrid" in args.gym_id.lower():

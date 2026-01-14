@@ -1,6 +1,4 @@
-from gym.spaces import space
 import numpy as np
-#from gym import spaces
 from gymnasium import spaces
 import time
 import os

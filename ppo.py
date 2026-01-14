@@ -1,8 +1,6 @@
 import argparse
-import os
 import random
 import time
-from distutils.util import strtobool
 
 import gymnasium as gym
 import wandb
@@ -15,11 +13,9 @@ from torch.distributions.normal import Normal
 from collections import deque
 
 from gae import compute_advantages
-from exp_utils import add_common_args, setup_logging, finish_logging, setup_wandb, finish_wandb
+from exp_utils import add_common_args, setup_wandb, finish_wandb
 from env_utils import make_atari_env, make_minigrid_env, make_poc_env, make_classic_env, make_memory_gym_env, make_continuous_env
 from layers import layer_init
-
-import ale_py # noqa: F401
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -185,6 +181,7 @@ if __name__ == "__main__":
 
     # Environment setup
     if "ale" in args.gym_id.lower():
+        import ale_py  # noqa: F401 # Register the Atari environments
         envs_lst = [make_atari_env(args.gym_id, args.seed + i, i, args.capture_video, 
                                    run_name, frame_stack=args.frame_stack) for i in range(args.num_envs)]
     elif "minigrid" in args.gym_id.lower():

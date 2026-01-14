@@ -104,3 +104,36 @@ def finish_logging(args, writer, run_name, envs):
 
     envs.close()
     writer.close()
+
+def setup_wandb(args):
+    """
+    Sets up Weights & Biases without TensorBoard.
+    Returns run_name.
+    """
+    run_name = f"{args.gym_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    wandb.init(
+        project=args.wandb_project_name,
+        entity=args.wandb_entity,
+        sync_tensorboard=False,
+        config=vars(args),
+        name=run_name,
+        monitor_gym=True,
+        save_code=True,
+        mode="online" if args.track else "disabled",
+    )
+    return run_name
+
+def finish_wandb(args, run_name, envs):
+    """
+    Cleans up: closes envs and closes W&B run.
+    """
+    if args.track and args.capture_video:
+        video_path = f"videos/{run_name}"
+        if os.path.exists(video_path):
+            video_files = [f for f in os.listdir(video_path) if f.endswith(('.mp4', '.gif'))]
+            for video_file in video_files:
+                wandb.log({"video": wandb.Video(os.path.join(video_path, video_file), fps=4, format="mp4")})
+
+    envs.close()
+    if args.track:
+        wandb.finish()

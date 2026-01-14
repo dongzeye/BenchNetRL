@@ -15,9 +15,11 @@ from torch.distributions.normal import Normal
 from collections import deque
 
 from gae import compute_advantages
-from exp_utils import add_common_args, setup_logging, finish_logging
+from exp_utils import add_common_args, setup_logging, finish_logging, setup_wandb, finish_wandb
 from env_utils import make_atari_env, make_minigrid_env, make_poc_env, make_classic_env, make_memory_gym_env, make_continuous_env
 from layers import layer_init
+
+import ale_py # noqa: F401
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -165,7 +167,7 @@ class Agent(nn.Module):
 
 if __name__ == "__main__":
     args = parse_args()
-    writer, run_name = setup_logging(args)
+    run_name = setup_wandb(args)
 
     # Seeding
     random.seed(args.seed)
@@ -271,11 +273,11 @@ if __name__ == "__main__":
                     avg_return = float(f'{np.mean(episodic_returns):.3f}')
                     avg_length = float(f'{np.mean(episodic_lengths):.3f}')
                     episode_infos.append({'r': avg_return, 'l': avg_length})
-                    writer.add_scalar("charts/episode_return", avg_return, global_step)
-                    writer.add_scalar("charts/episode_length", avg_length, global_step)
+                    wandb.log({"charts/episode_return": avg_return}, step=global_step)
+                    wandb.log({"charts/episode_length": avg_length}, step=global_step)
 
         avg_inference_latency = inference_time_total / args.num_steps
-        writer.add_scalar("metrics/inference_latency", avg_inference_latency, global_step)
+        wandb.log({"metrics/inference_latency": avg_inference_latency}, step=global_step)
 
         # bootstrap value if not done
         with torch.no_grad():
@@ -385,26 +387,28 @@ if __name__ == "__main__":
         print(f"Update {update}: SPS={sps}, Return={current_return:.2f}, "
               f"pi_loss={pg_loss.item():.6f}, v_loss={v_loss.item():.6f}, entropy={entropy_loss.item():.6f}, "
               f"explained_var={explained_var:.6f}")
-        writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
-        writer.add_scalar("losses/total_loss", avg_total_loss, global_step)
-        writer.add_scalar("losses/value_loss", avg_v_loss, global_step)
-        writer.add_scalar("losses/policy_loss", avg_pg_loss, global_step)
-        writer.add_scalar("losses/entropy", avg_entropy, global_step)
-        writer.add_scalar("losses/grad_norm", avg_grad_norm, global_step)
-        writer.add_scalar("losses/old_approx_kl", avg_old_approx_kl, global_step)
-        writer.add_scalar("losses/approx_kl", avg_approx_kl, global_step)
-        writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
-        writer.add_scalar("losses/explained_variance", explained_var, global_step)
-        writer.add_scalar("charts/SPS", sps, global_step)
+        wandb.log({
+            "charts/learning_rate": optimizer.param_groups[0]["lr"],
+            "losses/total_loss": avg_total_loss,
+            "losses/value_loss": avg_v_loss,
+            "losses/policy_loss": avg_pg_loss,
+            "losses/entropy": avg_entropy,
+            "losses/grad_norm": avg_grad_norm,
+            "losses/old_approx_kl": avg_old_approx_kl,
+            "losses/approx_kl": avg_approx_kl,
+            "losses/clipfrac": np.mean(clipfracs),
+            "losses/explained_variance": explained_var,
+            "charts/SPS": sps,
+        }, step=global_step)
 
         # Log average episode return
         if episode_infos:
             avg_episode_return = np.mean([ep['r'] for ep in episode_infos])
-            writer.add_scalar("charts/avg_episode_return", avg_episode_return, global_step)
+            wandb.log({"charts/avg_episode_return": avg_episode_return}, step=global_step)
 
         # Log training update duration (wall-clock time per update)
         update_time = time.time() - update_start_time
-        writer.add_scalar("metrics/training_time_per_update", update_time, global_step)
+        wandb.log({"metrics/training_time_per_update": update_time}, step=global_step)
         
         # Log GPU memory usage
         gpu_memory_allocated = torch.cuda.memory_allocated(device)  
@@ -416,10 +420,12 @@ if __name__ == "__main__":
         gpu_memory_allocated_percent = (gpu_memory_allocated / total_gpu_memory) * 100
         gpu_memory_reserved_percent = (gpu_memory_reserved / total_gpu_memory) * 100
 
-        writer.add_scalar("metrics/GPU_memory_allocated_GB", gpu_memory_allocated_gb, global_step)
-        writer.add_scalar("metrics/GPU_memory_reserved_GB", gpu_memory_reserved_gb, global_step)
-        writer.add_scalar("metrics/GPU_memory_allocated_percent", gpu_memory_allocated_percent, global_step)
-        writer.add_scalar("metrics/GPU_memory_reserved_percent", gpu_memory_reserved_percent, global_step)
+        wandb.log({
+            "metrics/GPU_memory_allocated_GB": gpu_memory_allocated_gb,
+            "metrics/GPU_memory_reserved_GB": gpu_memory_reserved_gb,
+            "metrics/GPU_memory_allocated_percent": gpu_memory_allocated_percent,
+            "metrics/GPU_memory_reserved_percent": gpu_memory_reserved_percent,
+        }, step=global_step)
         
         # Save model checkpoint every save_interval updates
         if args.save_model and update % args.save_interval == 0:
@@ -431,4 +437,4 @@ if __name__ == "__main__":
             torch.save(model_data, model_path)
             print(f"Model saved to {model_path}")
         
-    finish_logging(args, writer, run_name, envs)
+    finish_wandb(args, run_name, envs)

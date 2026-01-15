@@ -5,14 +5,19 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "ale-py>=0.11.2",
-     "gymnasium",
+    "ale-py",
+    "gymnasium",
     "mamba-ssm",
-    "minigrid>=3.0.0",
-    "opencv-python-headless>=4.12.0.88",
-    "stable-baselines3>=2.7.1",
-    "tensorboard>=2.20.0",
+    "minigrid",
+    "stable-baselines3",
+    "tensorboard",
     "torch",
     "wandb",
 ]
 
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["envs*", "plot_utils*", "envpool*", "carbs*"]

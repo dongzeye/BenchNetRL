@@ -40,6 +40,56 @@ class VecObservationStackWrapper(gym.ObservationWrapper):
         # Concatenate along the first axis.
         return np.concatenate(list(self.frames), axis=0)
 
+class OneHotObservationWrapper(gym.ObservationWrapper):
+    """Converts discrete observations to one-hot encoded vectors."""
+    def __init__(self, env):
+        super().__init__(env)
+        assert isinstance(env.observation_space, gym.spaces.Discrete), \
+            "OneHotObservationWrapper only works with Discrete observation spaces"
+        self.n = env.observation_space.n
+        self.observation_space = gym.spaces.Box(
+            low=0.0, high=1.0, shape=(self.n,), dtype=np.float32
+        )
+
+    def observation(self, observation):
+        one_hot = np.zeros(self.n, dtype=np.float32)
+        one_hot[observation] = 1.0
+        return one_hot
+
+
+class TimeAwareObservationWrapper(gym.Wrapper):
+    """Appends normalized remaining time (horizon - t) / horizon to observations."""
+    def __init__(self, env, horizon=None):
+        super().__init__(env)
+        # NOTE: Only works if the env has a 'horizon' attribute or wrapper
+        self.horizon = horizon or env.get_wrapper_attr("horizon")
+        self.current_step = 0
+        # Extend observation space by 1 dimension for time
+        orig_space = env.observation_space
+        orig_shape = orig_space.shape
+        new_shape = (np.prod(orig_shape) + 1,)
+        self.observation_space = gym.spaces.Box(
+            low=-np.inf, high=np.inf, shape=new_shape, dtype=np.float32
+        )
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self.current_step = 0
+        return self._add_time(obs), info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        self.current_step += 1
+        if terminated or truncated:
+            self.current_step = 0
+        return self._add_time(obs), reward, terminated, truncated, info
+
+    def _add_time(self, obs):
+        obs = np.array(obs, dtype=np.float32).flatten()
+        remaining_time = (self.horizon - self.current_step) / self.horizon
+        return np.append(obs, remaining_time)
+
+
 class MaskObservationWrapper(gym.ObservationWrapper):
     def __init__(self, env, mask_indices, mask_prob=1.0):
         super().__init__(env)
@@ -127,9 +177,13 @@ def make_atari_env(gym_id, seed, idx, capture_video, run_name, frame_stack=1):
         return env
     return thunk
 
-def make_classic_env(gym_id, seed, idx, capture_video, run_name, masked_indices=[], obs_stack=1):
+def make_classic_env(gym_id, seed, idx, capture_video, run_name, masked_indices=[], obs_stack=1, time_aware=False):
     def thunk():
         env = gym.make(gym_id, render_mode="rgb_array") if capture_video else gym.make(gym_id)
+        if isinstance(env.observation_space, gym.spaces.Discrete):
+            env = OneHotObservationWrapper(env)
+        if time_aware:
+            env = TimeAwareObservationWrapper(env)
         if masked_indices:
             env = MaskObservationWrapper(env, masked_indices)
         if obs_stack > 1:
@@ -144,8 +198,8 @@ def make_classic_env(gym_id, seed, idx, capture_video, run_name, masked_indices=
     return thunk
 
 def make_memory_gym_env(gym_id, seed, idx, capture_video, run_name):
+    import memory_gym # noqa: F401 # register the envs
     def thunk():
-        import memory_gym
         env = gym.make(
             gym_id,
             render_mode="rgb_array" if capture_video else None,

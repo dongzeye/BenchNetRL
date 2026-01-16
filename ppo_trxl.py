@@ -19,6 +19,8 @@ from exp_utils import add_common_args, setup_logging, finish_logging
 from env_utils import make_atari_env, make_minigrid_env, make_poc_env, make_classic_env, make_memory_gym_env, make_continuous_env
 from layers import Transformer, batched_index_select, layer_init
 
+import envs.finite_pomdp  # noqa: F401 # register finite pomdp envs
+
 def parse_args():
     parser = argparse.ArgumentParser()
     add_common_args(parser)
@@ -44,6 +46,13 @@ def parse_args():
         help="final entropy coefficient after annealing")
     parser.add_argument("--masked-indices", type=str, default="1,3",
         help="indices of the observations to mask")
+    parser.add_argument("--time-aware", action="store_true",
+        help="append normalized remaining time to observations")
+    # Evaluation arguments
+    parser.add_argument("--eval-freq", type=int, default=0,
+        help="Evaluate policy every N updates. 0 to disable.")
+    parser.add_argument("--eval-episodes", type=int, default=10,
+        help="Number of episodes per evaluation")
     args = parser.parse_args()
     args.masked_indices = [int(x) for x in args.masked_indices.split(',')]
     args.batch_size = int(args.num_envs * args.num_steps)
@@ -157,6 +166,68 @@ class Agent(nn.Module):
             logprob = torch.stack(logprobs, dim=1)
         return action, logprob, entropy, self.critic(x).flatten(), memory
 
+@torch.no_grad()
+def evaluate_policy(agent, eval_envs, num_episodes, device, args, max_episode_steps):
+    """Run Monte Carlo evaluation with stochastic actions using a single vectorized environment."""
+    agent.eval()
+    episode_returns, episode_lengths = [], []
+    episodes_completed = 0
+
+    obs, _ = eval_envs.reset()
+    obs = torch.tensor(obs, dtype=torch.float32, device=device)
+
+    # Initialize memory state for evaluation
+    memory = torch.zeros((1, max_episode_steps, args.trxl_num_layers, args.trxl_dim), dtype=torch.float32, device=device)
+    memory_mask = torch.tril(torch.ones((args.trxl_memory_length, args.trxl_memory_length)), diagonal=-1).to(device)
+    env_step = torch.zeros(1, dtype=torch.long, device=device)
+
+    # Memory indices
+    from_indices = torch.repeat_interleave(
+        torch.arange(0, args.trxl_memory_length, device=device).unsqueeze(0), args.trxl_memory_length - 1, dim=0
+    ).long()
+    to_indices = torch.stack(
+        [torch.arange(i, i + args.trxl_memory_length, device=device) for i in range(max_episode_steps - args.trxl_memory_length + 1)]
+    ).long()
+    memory_indices = torch.cat((from_indices, to_indices))
+
+    while episodes_completed < num_episodes:
+        mem_mask = memory_mask[torch.clip(env_step, 0, args.trxl_memory_length - 1)]
+        mem_indices = memory_indices[env_step]
+        memory_window = batched_index_select(memory, 1, mem_indices)
+
+        action, _, _, _, new_memory = agent.get_action_and_value(obs, memory_window, mem_mask, mem_indices)
+        memory[0, env_step[0]] = new_memory[0]
+
+        if agent.is_continuous:
+            next_obs, _, terminated, truncated, info = eval_envs.step(action.cpu().numpy())
+        else:
+            next_obs, _, terminated, truncated, info = eval_envs.step(action.cpu().numpy().squeeze(1))
+
+        done = np.logical_or(terminated, truncated)
+        if done[0]:
+            # Reset memory state on episode end
+            memory.zero_()
+            env_step.zero_()
+        else:
+            env_step[0] = min(env_step[0] + 1, max_episode_steps - 1)
+
+        final_info = info.get('final_info', {})
+        if '_episode' in final_info and final_info['_episode'][0]:
+            episode_returns.append(final_info['episode']['r'][0])
+            episode_lengths.append(final_info['episode']['l'][0])
+            episodes_completed += 1
+
+        obs = torch.tensor(next_obs, dtype=torch.float32, device=device)
+
+    agent.train()
+    return {
+        'mean': float(np.mean(episode_returns)),
+        'std': float(np.std(episode_returns)),
+        'min': float(np.min(episode_returns)),
+        'max': float(np.max(episode_returns)),
+        'length_mean': float(np.mean(episode_lengths)),
+    }
+
 if __name__ == "__main__":
     args = parse_args()
     writer, run_name = setup_logging(args)
@@ -192,9 +263,10 @@ if __name__ == "__main__":
         envs_lst = [make_continuous_env(args.gym_id, args.seed + i, i, args.capture_video,
                                         run_name) for i in range(args.num_envs)]
     else:
-        envs_lst = [make_classic_env(args.gym_id, args.seed + i, i, args.capture_video, 
-                                     run_name, masked_indices=args.masked_indices) for i in range(args.num_envs)]
-    envs = gym.vector.SyncVectorEnv(envs_lst)
+        envs_lst = [make_classic_env(args.gym_id, args.seed + i, i, args.capture_video,
+                                     run_name, masked_indices=args.masked_indices,
+                                     time_aware=args.time_aware) for i in range(args.num_envs)]
+    envs = gym.vector.SyncVectorEnv(envs_lst, autoreset_mode=gym.vector.AutoresetMode.SAME_STEP)
 
     env_current_episode_step = torch.zeros((args.num_envs,), dtype=torch.long)
     max_episode_steps = getattr(envs.envs[0], "max_episode_steps", 1024)
@@ -204,6 +276,30 @@ if __name__ == "__main__":
     if max_episode_steps <= 0:
         max_episode_steps = 1024
     args.trxl_memory_length = min(args.trxl_memory_length, max_episode_steps)
+
+    # Create single evaluation environment (reuse same factory with different seed)
+    eval_envs = None
+    if args.eval_freq > 0:
+        eval_seed = args.seed + 10000
+        if "ale" in args.gym_id.lower():
+            eval_envs_lst = [make_atari_env(args.gym_id, eval_seed, 0, False,
+                                            run_name, frame_stack=1)]
+        elif "minigrid" in args.gym_id.lower():
+            eval_envs_lst = [make_minigrid_env(args.gym_id, eval_seed, 0, False,
+                                               run_name, agent_view_size=3, tile_size=28, max_episode_steps=96)]
+        elif "poc" in args.gym_id.lower():
+            eval_envs_lst = [make_poc_env(args.gym_id, eval_seed, 0, False,
+                                          run_name, step_size=0.2, glob=False, freeze=False, max_episode_steps=96)]
+        elif args.gym_id == "MortarMayhem-Grid-v0":
+            eval_envs_lst = [make_memory_gym_env(args.gym_id, eval_seed, 0, False, run_name)]
+        elif args.gym_id in ["HalfCheetah-v4", "Hopper-v4", "Walker2d-v4"]:
+            eval_envs_lst = [make_continuous_env(args.gym_id, eval_seed, 0, False, run_name)]
+        else:
+            eval_envs_lst = [make_classic_env(args.gym_id, eval_seed, 0, False,
+                                              run_name, masked_indices=args.masked_indices,
+                                              time_aware=args.time_aware)]
+        eval_envs = gym.vector.SyncVectorEnv(eval_envs_lst, autoreset_mode=gym.vector.AutoresetMode.SAME_STEP)
+        print("Created evaluation environment")
 
     # Define action space
     observation_space = envs.single_observation_space
@@ -240,6 +336,7 @@ if __name__ == "__main__":
 
     # Start the game
     global_step = 0
+    episode_count = 0
     start_time = time.time()
     episode_infos = deque(maxlen=100)
     next_obs, _ = envs.reset(seed=[args.seed + i for i in range(args.num_envs)])
@@ -319,17 +416,18 @@ if __name__ == "__main__":
                     env_current_episode_step[idx] = min(env_current_episode_step[idx] + 1, max_episode_steps - 1)
                     #env_current_episode_step[idx] += 1
 
-            final_info = info.get('final_info')
-            if final_info is not None and len(final_info) > 0:
-                valid_entries = [entry for entry in final_info if entry is not None and 'episode' in entry]
-                if valid_entries:
-                    episodic_returns = [entry['episode']['r'] for entry in valid_entries]
-                    episodic_lengths = [entry['episode']['l'] for entry in valid_entries]
-                    avg_return = float(f'{np.mean(episodic_returns):.3f}')
-                    avg_length = float(f'{np.mean(episodic_lengths):.3f}')
-                    episode_infos.append({'r': avg_return, 'l': avg_length})
-                    writer.add_scalar("charts/episode_return", avg_return, global_step)
-                    writer.add_scalar("charts/episode_length", avg_length, global_step)
+            final_info = info.get('final_info', {})
+            if '_episode' in final_info:
+                episode_mask = final_info['_episode']  # Boolean array: which envs finished
+                episode_count += episode_mask.sum()
+                episodic_returns = final_info['episode']['r'][episode_mask]
+                episodic_lengths = final_info['episode']['l'][episode_mask]
+                avg_return = float(np.mean(episodic_returns))
+                avg_length = float(np.mean(episodic_lengths))
+                episode_infos.append({'r': avg_return, 'l': avg_length})
+                writer.add_scalar("charts/episode_return", avg_return, global_step)
+                writer.add_scalar("charts/episode_length", avg_length, global_step)
+                writer.add_scalar("charts/episode_count", episode_count, global_step)
 
         avg_inference_latency = inference_time_total / args.num_steps
         writer.add_scalar("metrics/inference_latency", avg_inference_latency, global_step)
@@ -506,7 +604,18 @@ if __name__ == "__main__":
         writer.add_scalar("metrics/GPU_memory_reserved_GB", gpu_memory_reserved_gb, global_step)
         writer.add_scalar("metrics/GPU_memory_allocated_percent", gpu_memory_allocated_percent, global_step)
         writer.add_scalar("metrics/GPU_memory_reserved_percent", gpu_memory_reserved_percent, global_step)
-        
+
+        # Periodic Monte Carlo evaluation
+        if args.eval_freq > 0 and update % args.eval_freq == 0:
+            eval_results = evaluate_policy(agent, eval_envs, args.eval_episodes, device, args, max_episode_steps)
+            writer.add_scalar("eval/return_mean", eval_results['mean'], global_step)
+            writer.add_scalar("eval/return_std", eval_results['std'], global_step)
+            writer.add_scalar("eval/return_min", eval_results['min'], global_step)
+            writer.add_scalar("eval/return_max", eval_results['max'], global_step)
+            writer.add_scalar("eval/episode_length_mean", eval_results['length_mean'], global_step)
+            writer.add_scalar("eval/train_episodes", episode_count, global_step)
+            print(f"Eval: mean={eval_results['mean']:.2f} (+/- {eval_results['std']:.2f})")
+
         # Save model checkpoint every save_interval updates
         if args.save_model and update % args.save_interval == 0:
             model_path = f"runs/{run_name}/{args.exp_name}_update_{update}.cleanrl_model"
@@ -516,5 +625,9 @@ if __name__ == "__main__":
             }
             torch.save(model_data, model_path)
             print(f"Model saved to {model_path}")
-        
+
+    # Cleanup evaluation environments
+    if eval_envs is not None:
+        eval_envs.close()
+
     finish_logging(args, writer, run_name, envs)

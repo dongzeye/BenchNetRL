@@ -13,9 +13,11 @@ from torch.distributions.normal import Normal
 from collections import deque
 
 from gae import compute_advantages
-from exp_utils import add_common_args, setup_wandb, finish_wandb
+from exp_utils import add_common_args, setup_logging, finish_logging
 from env_utils import make_atari_env, make_minigrid_env, make_poc_env, make_classic_env, make_memory_gym_env, make_continuous_env
 from layers import layer_init
+
+import envs.finite_pomdp # noqa: F401 # Register finite POMDP environments
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -28,6 +30,13 @@ def parse_args():
         help="indices of the observations to mask")
     parser.add_argument("--frame-stack", type=int, default=1,
         help="frame stack for the environment")
+    parser.add_argument("--time-aware", action="store_true",
+        help="append normalized remaining time to observations")
+    # Evaluation arguments
+    parser.add_argument("--eval-freq", type=int, default=0,
+        help="Evaluate policy every N updates. 0 to disable.")
+    parser.add_argument("--eval-episodes", type=int, default=10,
+        help="Number of episodes per evaluation")
     args = parser.parse_args()
     args.masked_indices = [int(x) for x in args.masked_indices.split(',')]
     args.batch_size = int(args.num_envs * args.num_steps)
@@ -161,9 +170,40 @@ class Agent(nn.Module):
         value = self.critic(hidden)
         return action, logprob, entropy, value
 
+@torch.no_grad()
+def evaluate_policy(agent, eval_envs, num_episodes, device):
+    """Run Monte Carlo evaluation with stochastic actions using a single vectorized environment."""
+    agent.eval()
+    episode_returns, episode_lengths = [], []
+    episodes_completed = 0
+
+    obs, _ = eval_envs.reset()
+    obs = torch.tensor(obs, dtype=torch.float32, device=device)
+
+    while episodes_completed < num_episodes:
+        action, _, _, _ = agent.get_action_and_value(obs)
+        next_obs, _, terminated, truncated, info = eval_envs.step(action.cpu().numpy())
+
+        final_info = info.get('final_info', {})
+        if '_episode' in final_info and final_info['_episode'][0]:
+            episode_returns.append(final_info['episode']['r'][0])
+            episode_lengths.append(final_info['episode']['l'][0])
+            episodes_completed += 1
+
+        obs = torch.tensor(next_obs, dtype=torch.float32, device=device)
+
+    agent.train()
+    return {
+        'mean': float(np.mean(episode_returns)),
+        'std': float(np.std(episode_returns)),
+        'min': float(np.min(episode_returns)),
+        'max': float(np.max(episode_returns)),
+        'length_mean': float(np.mean(episode_lengths)),
+    }
+
 if __name__ == "__main__":
     args = parse_args()
-    run_name = setup_wandb(args)
+    writer, run_name = setup_logging(args)
 
     # Seeding
     random.seed(args.seed)
@@ -197,9 +237,35 @@ if __name__ == "__main__":
         envs_lst = [make_continuous_env(args.gym_id, args.seed + i, i, args.capture_video,
                                         run_name, obs_stack=args.obs_stack) for i in range(args.num_envs)]
     else:
-        envs_lst = [make_classic_env(args.gym_id, args.seed + i, i, args.capture_video, 
-                                     run_name, masked_indices=args.masked_indices, obs_stack=args.obs_stack) for i in range(args.num_envs)]
-    envs = gym.vector.SyncVectorEnv(envs_lst)
+        envs_lst = [make_classic_env(args.gym_id, args.seed + i, i, args.capture_video,
+                                     run_name, masked_indices=args.masked_indices, obs_stack=args.obs_stack,
+                                     time_aware=args.time_aware) for i in range(args.num_envs)]
+    envs = gym.vector.SyncVectorEnv(envs_lst, autoreset_mode=gym.vector.AutoresetMode.SAME_STEP)
+
+    # Create single evaluation environment (reuse same factory with different seed)
+    eval_envs = None
+    if args.eval_freq > 0:
+        eval_seed = args.seed + 10000
+        if "ale" in args.gym_id.lower():
+            eval_envs_lst = [make_atari_env(args.gym_id, eval_seed, 0, False,
+                                            run_name, frame_stack=args.frame_stack)]
+        elif "minigrid" in args.gym_id.lower():
+            eval_envs_lst = [make_minigrid_env(args.gym_id, eval_seed, 0, False,
+                                               run_name, agent_view_size=3, tile_size=28, max_episode_steps=96, frame_stack=args.frame_stack)]
+        elif "poc" in args.gym_id.lower():
+            eval_envs_lst = [make_poc_env(args.gym_id, eval_seed, 0, False,
+                                          run_name, step_size=0.02, glob=False, freeze=True, max_episode_steps=96)]
+        elif args.gym_id == "MortarMayhem-Grid-v0":
+            eval_envs_lst = [make_memory_gym_env(args.gym_id, eval_seed, 0, False, run_name)]
+        elif args.gym_id in ["HalfCheetah-v4", "Hopper-v4", "Walker2d-v4"]:
+            eval_envs_lst = [make_continuous_env(args.gym_id, eval_seed, 0, False,
+                                                 run_name, obs_stack=args.obs_stack)]
+        else:
+            eval_envs_lst = [make_classic_env(args.gym_id, eval_seed, 0, False,
+                                              run_name, masked_indices=args.masked_indices, obs_stack=args.obs_stack,
+                                              time_aware=args.time_aware)]
+        eval_envs = gym.vector.SyncVectorEnv(eval_envs_lst, autoreset_mode=gym.vector.AutoresetMode.SAME_STEP)
+        print("Created evaluation environment")
 
     agent = Agent(envs, args).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
@@ -223,6 +289,7 @@ if __name__ == "__main__":
 
     # Start the game
     global_step = 0
+    episode_count = 0
     start_time = time.time()
     episode_infos = deque(maxlen=100)
     next_obs, _ = envs.reset(seed=[args.seed + i for i in range(args.num_envs)])
@@ -255,26 +322,27 @@ if __name__ == "__main__":
 
             # Execute the game and log data
             next_obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
+            # Note: We treat time-limits as end of episodes in the finite horizon setting
             done = np.logical_or(terminated, truncated)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs = torch.Tensor(next_obs).to(device)
             next_done = torch.Tensor(done).to(device)
 
-
-            final_info = info.get('final_info')
-            if final_info is not None and len(final_info) > 0:
-                valid_entries = [entry for entry in final_info if entry is not None and 'episode' in entry]
-                if valid_entries:
-                    episodic_returns = [entry['episode']['r'] for entry in valid_entries]
-                    episodic_lengths = [entry['episode']['l'] for entry in valid_entries]
-                    avg_return = float(f'{np.mean(episodic_returns):.3f}')
-                    avg_length = float(f'{np.mean(episodic_lengths):.3f}')
-                    episode_infos.append({'r': avg_return, 'l': avg_length})
-                    wandb.log({"charts/episode_return": avg_return}, step=global_step)
-                    wandb.log({"charts/episode_length": avg_length}, step=global_step)
+            final_info = info.get('final_info', {})
+            if '_episode' in final_info:
+                episode_mask = final_info['_episode']  # Boolean array: which envs finished
+                episode_count += episode_mask.sum()
+                episodic_returns = final_info['episode']['r'][episode_mask]
+                episodic_lengths = final_info['episode']['l'][episode_mask]
+                avg_return = float(np.mean(episodic_returns))
+                avg_length = float(np.mean(episodic_lengths))
+                episode_infos.append({'r': avg_return, 'l': avg_length})
+                writer.add_scalar("charts/episode_return", avg_return, global_step)
+                writer.add_scalar("charts/episode_length", avg_length, global_step)
+                writer.add_scalar("charts/episode_count", episode_count, global_step)
 
         avg_inference_latency = inference_time_total / args.num_steps
-        wandb.log({"metrics/inference_latency": avg_inference_latency}, step=global_step)
+        writer.add_scalar("metrics/inference_latency", avg_inference_latency, global_step)
 
         # bootstrap value if not done
         with torch.no_grad():
@@ -384,28 +452,26 @@ if __name__ == "__main__":
         print(f"Update {update}: SPS={sps}, Return={current_return:.2f}, "
               f"pi_loss={pg_loss.item():.6f}, v_loss={v_loss.item():.6f}, entropy={entropy_loss.item():.6f}, "
               f"explained_var={explained_var:.6f}")
-        wandb.log({
-            "charts/learning_rate": optimizer.param_groups[0]["lr"],
-            "losses/total_loss": avg_total_loss,
-            "losses/value_loss": avg_v_loss,
-            "losses/policy_loss": avg_pg_loss,
-            "losses/entropy": avg_entropy,
-            "losses/grad_norm": avg_grad_norm,
-            "losses/old_approx_kl": avg_old_approx_kl,
-            "losses/approx_kl": avg_approx_kl,
-            "losses/clipfrac": np.mean(clipfracs),
-            "losses/explained_variance": explained_var,
-            "charts/SPS": sps,
-        }, step=global_step)
+        writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
+        writer.add_scalar("losses/total_loss", avg_total_loss, global_step)
+        writer.add_scalar("losses/value_loss", avg_v_loss, global_step)
+        writer.add_scalar("losses/policy_loss", avg_pg_loss, global_step)
+        writer.add_scalar("losses/entropy", avg_entropy, global_step)
+        writer.add_scalar("losses/grad_norm", avg_grad_norm, global_step)
+        writer.add_scalar("losses/old_approx_kl", avg_old_approx_kl, global_step)
+        writer.add_scalar("losses/approx_kl", avg_approx_kl, global_step)
+        writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
+        writer.add_scalar("losses/explained_variance", explained_var, global_step)
+        writer.add_scalar("charts/SPS", sps, global_step)
 
         # Log average episode return
         if episode_infos:
             avg_episode_return = np.mean([ep['r'] for ep in episode_infos])
-            wandb.log({"charts/avg_episode_return": avg_episode_return}, step=global_step)
+            writer.add_scalar("charts/avg_episode_return", avg_episode_return, global_step)
 
         # Log training update duration (wall-clock time per update)
         update_time = time.time() - update_start_time
-        wandb.log({"metrics/training_time_per_update": update_time}, step=global_step)
+        writer.add_scalar("metrics/training_time_per_update", update_time, global_step)
         
         # Log GPU memory usage
         gpu_memory_allocated = torch.cuda.memory_allocated(device)  
@@ -417,13 +483,22 @@ if __name__ == "__main__":
         gpu_memory_allocated_percent = (gpu_memory_allocated / total_gpu_memory) * 100
         gpu_memory_reserved_percent = (gpu_memory_reserved / total_gpu_memory) * 100
 
-        wandb.log({
-            "metrics/GPU_memory_allocated_GB": gpu_memory_allocated_gb,
-            "metrics/GPU_memory_reserved_GB": gpu_memory_reserved_gb,
-            "metrics/GPU_memory_allocated_percent": gpu_memory_allocated_percent,
-            "metrics/GPU_memory_reserved_percent": gpu_memory_reserved_percent,
-        }, step=global_step)
-        
+        writer.add_scalar("metrics/GPU_memory_allocated_GB", gpu_memory_allocated_gb, global_step)
+        writer.add_scalar("metrics/GPU_memory_reserved_GB", gpu_memory_reserved_gb, global_step)
+        writer.add_scalar("metrics/GPU_memory_allocated_percent", gpu_memory_allocated_percent, global_step)
+        writer.add_scalar("metrics/GPU_memory_reserved_percent", gpu_memory_reserved_percent, global_step)
+
+        # Periodic Monte Carlo evaluation
+        if args.eval_freq > 0 and update % args.eval_freq == 0:
+            eval_results = evaluate_policy(agent, eval_envs, args.eval_episodes, device)
+            writer.add_scalar("eval/return_mean", eval_results['mean'], global_step)
+            writer.add_scalar("eval/return_std", eval_results['std'], global_step)
+            writer.add_scalar("eval/return_min", eval_results['min'], global_step)
+            writer.add_scalar("eval/return_max", eval_results['max'], global_step)
+            writer.add_scalar("eval/episode_length_mean", eval_results['length_mean'], global_step)
+            writer.add_scalar("eval/train_episodes", episode_count, global_step)
+            print(f"Eval: mean={eval_results['mean']:.2f} (+/- {eval_results['std']:.2f})")
+
         # Save model checkpoint every save_interval updates
         if args.save_model and update % args.save_interval == 0:
             model_path = f"runs/{run_name}/{args.exp_name}_update_{update}.cleanrl_model"
@@ -433,5 +508,9 @@ if __name__ == "__main__":
             }
             torch.save(model_data, model_path)
             print(f"Model saved to {model_path}")
-        
-    finish_wandb(args, run_name, envs)
+
+    # Cleanup evaluation environments
+    if eval_envs is not None:
+        eval_envs.close()
+
+    finish_logging(args, writer, run_name, envs)

@@ -5,13 +5,14 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "ale-py",
+    "numpy",
+    "torch",
     "gymnasium",
+    "ale-py",
     "mamba-ssm",
     "minigrid",
     "stable-baselines3",
     "tensorboard",
-    "torch",
     "wandb",
 ]
 
